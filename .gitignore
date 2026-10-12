@@ -1,0 +1,50 @@
+creds.txt
+telegram/telegram.env
+telegram/admin.env
+telegram/*.sqlite3
+.codex-tools/
+clients/
+telegram.env
+
+# Local secrets and environment files
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example
+!.env.sample
+!*.env.sample
+*credentials*.json
+service-account*.json
+secrets/
+.secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+*.keystore
+id_rsa*
+id_ed25519*
+
+# Generated VPN profiles and customer subscription data
+*.conf
+*.ovpn
+outputs/
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+
+# Python caches and local dependencies
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+
+# Logs and local editor files
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

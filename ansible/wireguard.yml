@@ -1,0 +1,207 @@
+---
+- name: Install and configure WireGuard server
+  hosts: vpn
+  become: true
+  gather_facts: true
+
+  vars:
+    wireguard_interface: wg0
+    wireguard_address: 10.66.66.1/24
+    wireguard_network: 10.66.66.0/24
+    wireguard_port: 443
+    wireguard_dir: /etc/wireguard
+    ssh_port: 22
+    wireguard_clients:
+      - name: Abu
+        address: 10.66.66.3/32
+      - name: Rayana
+        address: 10.66.66.4/32
+      - name: Yerassyl
+        address: 10.66.66.5/32
+      - name: nurdaulet_m
+        address: 10.66.66.6/32
+      - name: kairat-94
+        address: 10.66.66.7/32
+      - name: zhannur_t
+        address: 10.66.66.8/32
+      - name: salimzhan
+        address: 10.66.66.10/32
+      - name: dastan
+        address: 10.66.66.11/32
+
+  tasks:
+    - name: Install WireGuard
+      ansible.builtin.apt:
+        name:
+          - wireguard
+          - ufw
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Enable IPv4 forwarding permanently
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-wireguard-forward.conf
+        content: |
+          net.ipv4.ip_forward = 1
+          net.core.default_qdisc = fq
+          net.ipv4.tcp_congestion_control = bbr
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload sysctl
+
+    - name: Load BBR automatically at boot
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/bbr.conf
+        content: "tcp_bbr\n"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Load BBR now
+      ansible.builtin.command: modprobe tcp_bbr
+      changed_when: false
+
+    - name: Create WireGuard directory
+      ansible.builtin.file:
+        path: "{{ wireguard_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Generate server private key
+      ansible.builtin.shell:
+        cmd: "umask 077 && wg genkey > {{ wireguard_dir }}/server_private.key"
+        creates: "{{ wireguard_dir }}/server_private.key"
+      no_log: true
+
+    - name: Generate server public key
+      ansible.builtin.shell:
+        cmd: "wg pubkey < {{ wireguard_dir }}/server_private.key > {{ wireguard_dir }}/server_public.key"
+        creates: "{{ wireguard_dir }}/server_public.key"
+
+    - name: Create client key directory
+      ansible.builtin.file:
+        path: "{{ wireguard_dir }}/clients"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Generate client private keys
+      ansible.builtin.shell:
+        cmd: "umask 077 && wg genkey > {{ wireguard_dir }}/clients/{{ item.name }}.key"
+        creates: "{{ wireguard_dir }}/clients/{{ item.name }}.key"
+      loop: "{{ wireguard_clients }}"
+      no_log: true
+
+    - name: Generate client public keys
+      ansible.builtin.shell:
+        cmd: >-
+          wg pubkey < {{ wireguard_dir }}/clients/{{ item.name }}.key
+          > {{ wireguard_dir }}/clients/{{ item.name }}.pub
+        creates: "{{ wireguard_dir }}/clients/{{ item.name }}.pub"
+      loop: "{{ wireguard_clients }}"
+
+    - name: Read server public key
+      ansible.builtin.slurp:
+        src: "{{ wireguard_dir }}/server_public.key"
+      register: wireguard_server_public_key
+
+    - name: Read client private keys
+      ansible.builtin.slurp:
+        src: "{{ wireguard_dir }}/clients/{{ item.name }}.key"
+      loop: "{{ wireguard_clients }}"
+      register: wireguard_client_private_keys
+      no_log: true
+
+    - name: Read client public keys
+      ansible.builtin.slurp:
+        src: "{{ wireguard_dir }}/clients/{{ item.name }}.pub"
+      loop: "{{ wireguard_clients }}"
+      register: wireguard_client_public_keys
+
+    - name: Read server private key
+      ansible.builtin.slurp:
+        src: "{{ wireguard_dir }}/server_private.key"
+      register: wireguard_private_key
+      no_log: true
+
+    - name: Write WireGuard server configuration
+      ansible.builtin.template:
+        src: templates/wg0.conf.j2
+        dest: "{{ wireguard_dir }}/{{ wireguard_interface }}.conf"
+        owner: root
+        group: root
+        mode: "0600"
+      notify: Restart WireGuard
+      no_log: true
+
+    - name: Write client configurations
+      ansible.builtin.template:
+        src: templates/client.conf.j2
+        dest: "{{ wireguard_dir }}/clients/{{ item.name }}.conf"
+        owner: root
+        group: root
+        mode: "0600"
+      loop: "{{ wireguard_clients }}"
+      loop_control:
+        index_var: client_index
+      no_log: true
+
+    - name: Enable and start WireGuard
+      ansible.builtin.systemd_service:
+        name: "wg-quick@{{ wireguard_interface }}"
+        enabled: true
+        state: started
+
+    - name: Allow SSH before enabling firewall
+      ansible.builtin.command: "ufw allow {{ ssh_port }}/tcp comment 'SSH'"
+      register: ufw_ssh
+      changed_when: "'Rule added' in ufw_ssh.stdout or 'Rules updated' in ufw_ssh.stdout"
+
+    - name: Allow WireGuard UDP port
+      ansible.builtin.command: "ufw allow {{ wireguard_port }}/udp comment 'WireGuard'"
+      register: ufw_wireguard
+      changed_when: "'Rule added' in ufw_wireguard.stdout or 'Rules updated' in ufw_wireguard.stdout"
+
+    - name: Check current firewall rules
+      ansible.builtin.command: ufw status
+      register: ufw_status_before_cleanup
+      changed_when: false
+
+    - name: Remove old WireGuard UDP port
+      ansible.builtin.command: ufw --force delete allow 51820/udp
+      when: "'51820/udp' in ufw_status_before_cleanup.stdout"
+
+    - name: Allow VPN clients to route to the internet
+      ansible.builtin.command: >-
+        ufw route allow in on {{ wireguard_interface }}
+        out on {{ ansible_default_ipv4.interface }}
+        from {{ wireguard_network }}
+      register: ufw_route
+      changed_when: "'Rule added' in ufw_route.stdout or 'Rules updated' in ufw_route.stdout"
+
+    - name: Set default incoming policy to deny
+      ansible.builtin.command: ufw default deny incoming
+      changed_when: false
+
+    - name: Set default outgoing policy to allow
+      ansible.builtin.command: ufw default allow outgoing
+      changed_when: false
+
+    - name: Enable firewall
+      ansible.builtin.command: ufw --force enable
+      changed_when: false
+
+  handlers:
+    - name: Reload sysctl
+      ansible.builtin.command: sysctl --system
+      changed_when: true
+
+    - name: Restart WireGuard
+      ansible.builtin.systemd_service:
+        name: "wg-quick@{{ wireguard_interface }}"
+        state: restarted

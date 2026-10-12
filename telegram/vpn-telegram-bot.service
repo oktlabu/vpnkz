@@ -1,0 +1,22 @@
+[Unit]
+Description=VPN Telegram administration bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vpn-bot
+Group=vpn-bot
+WorkingDirectory=/opt/vpn-telegram-bot
+ExecStart=/usr/bin/python3 /opt/vpn-telegram-bot/bot.py
+Restart=on-failure
+RestartSec=5
+MemoryMax=200M
+CPUQuota=20%
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/vpn-telegram-bot /etc/wireguard
+
+[Install]
+WantedBy=multi-user.target

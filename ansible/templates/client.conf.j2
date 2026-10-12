@@ -1,0 +1,11 @@
+[Interface]
+PrivateKey = {{ wireguard_client_private_keys.results[client_index].content | b64decode | trim }}
+Address = {{ item.address }}
+DNS = 1.1.1.1
+MTU = 1280
+
+[Peer]
+PublicKey = {{ wireguard_server_public_key.content | b64decode | trim }}
+Endpoint = {{ ansible_default_ipv4.address }}:{{ wireguard_port }}
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25

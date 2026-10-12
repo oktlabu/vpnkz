@@ -1,0 +1,14 @@
+[Unit]
+Description=VPN services and disk health check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 /usr/local/sbin/vpn-healthcheck
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/vpn-healthcheck
+

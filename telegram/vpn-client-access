@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+import re
+import json
+import os
+import grp
+import pwd
+import subprocess
+import sys
+from pathlib import Path
+
+CLIENT_DIR = Path("/etc/wireguard/clients")
+OUTBOX_DIR = Path("/opt/vpn-telegram-bot/outbox")
+
+if len(sys.argv) != 3 or sys.argv[1] not in {"create", "delete", "disable", "enable"}:
+    raise SystemExit("Usage: vpn-client-access create|delete|disable|enable CLIENT_NAME")
+
+action = sys.argv[1]
+name = sys.argv[2]
+if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", name):
+    raise SystemExit("Invalid client name")
+
+private_key_file = CLIENT_DIR / f"{name}.key"
+public_key_file = CLIENT_DIR / f"{name}.pub"
+config_file = CLIENT_DIR / f"{name}.conf"
+marker_file = CLIENT_DIR / f"{name}.bot-managed"
+
+if action == "delete":
+    if name == "Abu":
+        raise SystemExit("Protected client cannot be deleted")
+    public_key = public_key_file.read_text(encoding="ascii").strip() if public_key_file.is_file() else ""
+    if public_key and re.fullmatch(r"[A-Za-z0-9+/]{43}=", public_key):
+        subprocess.run(["/usr/bin/wg", "set", "wg0", "peer", public_key, "remove"], check=True)
+    server_config = Path("/etc/wireguard/wg0.conf")
+    if server_config.is_file():
+        text = server_config.read_text(encoding="utf-8")
+        pattern = rf"\n\[Peer\]\n# bot:{re.escape(name)}\nPublicKey = [^\n]+\nAllowedIPs = [^\n]+\n?"
+        text = re.sub(pattern, "\n", text)
+        if public_key:
+            peer_pattern = rf"\n\[Peer\]\n(?:#[^\n]*\n)?PublicKey = {re.escape(public_key)}\nAllowedIPs = [^\n]+\n?"
+            text = re.sub(peer_pattern, "\n", text)
+        server_config.write_text(text, encoding="utf-8")
+    for path in (private_key_file, public_key_file, config_file, marker_file, OUTBOX_DIR / f"{name}.conf"):
+        path.unlink(missing_ok=True)
+    print(json.dumps({"name": name, "deleted": True}))
+    raise SystemExit(0)
+
+if action == "create":
+    if any(path.exists() for path in (private_key_file, public_key_file, config_file, marker_file)):
+        raise SystemExit("Client already exists")
+    used = set()
+    for existing in CLIENT_DIR.glob("*.conf"):
+        match = re.search(r"(?m)^Address\s*=\s*10\.66\.66\.(\d{1,3})/32", existing.read_text(encoding="utf-8"))
+        if match:
+            used.add(int(match.group(1)))
+    host = max(used | {2}) + 1
+    if host > 254:
+        raise SystemExit("No free VPN addresses")
+    address = f"10.66.66.{host}/32"
+    private_key = subprocess.run(["/usr/bin/wg", "genkey"], check=True, capture_output=True, text=True).stdout.strip()
+    public_key = subprocess.run(
+        ["/usr/bin/wg", "pubkey"], input=private_key + "\n", check=True, capture_output=True, text=True
+    ).stdout.strip()
+    server_public_key = Path("/etc/wireguard/server_public.key").read_text(encoding="ascii").strip()
+    endpoint_match = re.search(
+        r"(?m)^Endpoint\s*=\s*(\S+)", (CLIENT_DIR / "Abu.conf").read_text(encoding="utf-8")
+    )
+    if not endpoint_match:
+        raise SystemExit("Server endpoint not found")
+    config = (
+        "[Interface]\n"
+        f"PrivateKey = {private_key}\n"
+        f"Address = {address}\n"
+        "DNS = 1.1.1.1\n"
+        "MTU = 1280\n\n"
+        "[Peer]\n"
+        f"PublicKey = {server_public_key}\n"
+        f"Endpoint = {endpoint_match.group(1)}\n"
+        "AllowedIPs = 0.0.0.0/0, ::/0\n"
+        "PersistentKeepalive = 25\n"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    for path, content in ((private_key_file, private_key + "\n"), (public_key_file, public_key + "\n"), (config_file, config), (marker_file, "bot-managed\n")):
+        fd = os.open(path, flags, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(content)
+    vpn_bot_user = pwd.getpwnam("vpn-bot")
+    vpn_bot_gid = grp.getgrnam("vpn-bot").gr_gid
+    os.chown(config_file, 0, vpn_bot_gid)
+    os.chmod(config_file, 0o640)
+    OUTBOX_DIR.mkdir(mode=0o750, parents=True, exist_ok=True)
+    os.chown(OUTBOX_DIR, vpn_bot_user.pw_uid, vpn_bot_gid)
+    os.chmod(OUTBOX_DIR, 0o750)
+    outbox_config = OUTBOX_DIR / f"{name}.conf"
+    outbox_config.write_text(config, encoding="utf-8")
+    os.chown(outbox_config, 0, vpn_bot_gid)
+    os.chmod(outbox_config, 0o640)
+    server_config = Path("/etc/wireguard/wg0.conf")
+    block = f"\n[Peer]\n# bot:{name}\nPublicKey = {public_key}\nAllowedIPs = {address}\n"
+    with server_config.open("a", encoding="utf-8") as stream:
+        stream.write(block)
+    subprocess.run(["/usr/bin/wg", "set", "wg0", "peer", public_key, "allowed-ips", address], check=True)
+    print(json.dumps({"name": name, "ip": address.removesuffix("/32"), "config": str(outbox_config)}))
+    raise SystemExit(0)
+
+if not public_key_file.is_file():
+    raise SystemExit("Client public key not found")
+
+public_key = public_key_file.read_text(encoding="ascii").strip()
+if not re.fullmatch(r"[A-Za-z0-9+/]{43}=", public_key):
+    raise SystemExit("Invalid WireGuard public key")
+
+if action == "disable":
+    subprocess.run(["/usr/bin/wg", "set", "wg0", "peer", public_key, "remove"], check=True)
+    if marker_file.exists():
+        server_config = Path("/etc/wireguard/wg0.conf")
+        text = server_config.read_text(encoding="utf-8")
+        pattern = rf"\n\[Peer\]\n# bot:{re.escape(name)}\nPublicKey = [^\n]+\nAllowedIPs = [^\n]+\n?"
+        server_config.write_text(re.sub(pattern, "\n", text), encoding="utf-8")
+else:
+    if not config_file.is_file():
+        raise SystemExit("Client config not found")
+    match = re.search(r"(?m)^Address\s*=\s*([^\s,]+)", config_file.read_text(encoding="utf-8"))
+    if not match or not re.fullmatch(r"10\.66\.66\.\d{1,3}/32", match.group(1)):
+        raise SystemExit("Invalid client VPN address")
+    subprocess.run(
+        ["/usr/bin/wg", "set", "wg0", "peer", public_key, "allowed-ips", match.group(1)],
+        check=True,
+    )
+    if marker_file.exists():
+        server_config = Path("/etc/wireguard/wg0.conf")
+        text = server_config.read_text(encoding="utf-8")
+        if f"# bot:{name}\n" not in text:
+            block = f"\n[Peer]\n# bot:{name}\nPublicKey = {public_key}\nAllowedIPs = {match.group(1)}\n"
+            with server_config.open("a", encoding="utf-8") as stream:
+                stream.write(block)
